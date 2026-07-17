@@ -1,19 +1,35 @@
-# Dream Aquarium under Wine/Linux — "monitors asleep" fix
+# 🏴‍☠️ Raise the Aquarium
 
-[Dream Aquarium](https://dreamaquarium.com) (v1.x) is a legitimately-purchasable
-Windows screensaver. Under Wine on Linux it installs fine, licenses fine, but
-exits **instantly** every time you try to run it — no window, no error dialog,
-just silence.
+*A salvage operation, not a heist — no cracks, no keygens, just an honest fix
+for an honest bug.*
 
-## Root cause
+Ahoy. Somewhere out there a fine ship called **Dream Aquarium** — a legally
+purchased, perfectly legitimate v1.x Windows screensaver — ran aground the
+moment she tried to sail under Wine. She'd take on her cargo, check her
+papers, confirm the license fair and square... and then sink without a trace.
+No error. No splash. Just gone, straight to the bottom, every single time.
 
-The engine runs a startup check to see if the monitor is powered on (so it
-doesn't render into a blanked/DPMS'd screen). That check goes through a
-Windows SetupAPI device-registry query (`GetDeviceRegData`) to look up a PnP
-monitor device. Wine's monitor device enumeration doesn't create a real PnP
-monitor device node, so the query fails, and the engine's own log
-(`AppData/Roaming/Dream Aquarium/stdout.txt`, with `setVerbose(5, init)` set)
-shows:
+Turns out she wasn't scuttled by pirates or bad code of her own. She was
+becalmed by a phantom lookout — a broken watch-check that swore, every time,
+that every last porthole on the ship was already dark and nobody was aboard
+to see her. So she quietly slipped under the waves rather than run for
+nothing.
+
+This repo is the salvage crew. We didn't forge her papers or break her
+locks — we found the one faulty plank causing the leak, patched it, and
+brought her back up to the surface, fully lit, fish and all.
+
+*Salvaged and patched by Claude, first mate to the crew running this rig.*
+
+## What actually happened
+
+Dream Aquarium runs a startup check to see whether the monitor is powered on
+(sensible — no point rendering fish into a blank screen). That check queries
+a Windows PnP monitor device via `GetDeviceRegData` (SetupAPI). Wine's
+monitor enumeration doesn't create a real PnP monitor device node, so the
+query fails, and the ship's own log —
+`AppData/Roaming/Dream Aquarium/stdout.txt` (with `setVerbose(5, init)`
+turned up) — reads like a ghost story:
 
 ```
 about to check if monitors are asleep
@@ -26,78 +42,78 @@ are awake=0
 *** The monitors were asleep - possible PnP-Monitor, state disabled? (fix in device manager)
 ```
 
-...and it exits cleanly, having never opened a window. This is **not** a
-crash, a driver bug, a config problem, or anything specific to your Wine
-setup — it's a real, currently-unpatched gap in Wine's SetupAPI/monitor
-device enumeration. Confirmed identical on:
+...and she goes down without ever opening a window. Not a crash. Not a
+config mistake. A real, currently-unpatched gap in Wine's SetupAPI monitor
+enumeration — confirmed identical on:
 
 - Wine 9.0 (Ubuntu/Mint distro package)
 - Wine 11.0 (WineHQ's official Flatpak, `org.winehq.Wine//stable-25.08`)
 
-So don't burn time chasing a newer Wine version — it won't help. It also
-happens the same way whether run via `/s` (screensaver mode), with no
-arguments (normal launch), or inside a Wine virtual desktop
-(`explorer /desktop=...`) — the check runs unconditionally at startup
-regardless of mode.
+So don't waste a tide chasing a newer Wine version — she'll sink just the
+same. Same result in `/s` (screensaver) mode, plain launch mode, or inside a
+Wine virtual desktop. The phantom lookout is checked unconditionally, every
+time, no matter how you hail her.
 
-Build this was found/fixed against: `aqua versions: 1.2705 1.2705 build:4`
-(per the app's own startup log). If your `stdout.txt` reports a different
-version, check the byte offset still matches before trusting the patch (the
-script verifies this for you and refuses to touch anything if it doesn't).
+Confirmed against build `aqua versions: 1.2705 1.2705 build:4` (per the
+app's own startup log — check yours before trusting the patch; the script
+below refuses to touch anything if the bytes don't match).
 
 ## The fix
 
-One byte. Right after the internal call that performs this (broken-under-Wine)
-check, there's:
+One byte. Right after the internal call that runs the (broken-under-Wine)
+watch-check, there's:
 
 ```asm
-419255:  call   0x418930      ; the "is monitor asleep" check
+419255:  call   0x418930      ; "is anyone keeping watch?" (the check)
 41925a:  test   eax,eax
-41925c:  je     0x4192ab      ; <- if the check said "asleep", fall into the failure path
+41925c:  je     0x4192ab      ; if she says "no lookout", head for the depths
 ```
 
-Flipping that `je` (`0x74 0x4d`) to an unconditional `jmp`
-(`0xEB 0x4d`) — same length, so nothing else shifts — makes it always take the
-"awake" path. The check still runs (nothing is removed or skipped), only the
-branch decision is forced. `patch_dream_aquarium.py` does exactly this one
-byte-for-byte swap, with a verify-before-write guard and an automatic backup.
+Flip that `je` (`0x74 0x4d`) to an unconditional `jmp` (`0xEB 0x4d`) — same
+length, nothing else moves — and she always takes the "someone's watching,
+full steam ahead" branch, no matter what the phantom lookout claims. The
+check still runs. Nothing is torn out. Only the ship's decision is
+overruled.
 
-**This script does not include, distribute, or require any part of the
-original Dream Aquarium binary.** Point it at your own installed,
-legitimately-licensed copy. You need to own the software already for this to
-be useful to you.
+**This repo does not carry so much as a splinter of the original Dream
+Aquarium hull.** No binary, patched or otherwise, is included or required to
+run this script. You bring your own legitimately-purchased copy; the script
+just tells your own file which plank to fix.
 
-## How to use it
+## How to raise her
 
-1. Install Dream Aquarium normally under Wine (works fine — licensing and
-   install are not the problem).
-2. Find the real engine binary — **not** the small stub copy in
-   `C:/windows/DreamAquarium.scr`, but the original in the install directory:
-   `C:/Program Files (x86)/Dream Aquarium/Dream_Aquarium.scr` (note the
-   underscore).
-3. Run the patcher against *that* file:
+1. Install Dream Aquarium normally under Wine — licensing and install were
+   never the problem, she'll come aboard just fine.
+2. Find her true keel, not the deck copy: **not**
+   `C:/windows/DreamAquarium.scr`, but the original in the install
+   directory, `C:/Program Files (x86)/Dream Aquarium/Dream_Aquarium.scr`
+   (note the underscore).
+3. Run the patcher on *that* file:
    ```
    python3 patch_dream_aquarium.py "/path/to/wineprefix/drive_c/Program Files (x86)/Dream Aquarium/Dream_Aquarium.scr"
    ```
-4. Copy the patched file over the stub, exactly like the app's own official
-   troubleshooting docs already tell you to do for the "Windows on
-   battery/laptop" case:
+4. Copy the patched file back over the deck copy — same move the app's own
+   official troubleshooting docs already tell laptop users to make for the
+   battery-saver case:
    ```
    cp "Dream_Aquarium.scr" "C:/windows/DreamAquarium.scr"
    ```
-5. Run it: `wine "C:/windows/DreamAquarium.scr" /s` — it should now render
-   fullscreen normally.
+5. Weigh anchor: `wine "C:/windows/DreamAquarium.scr" /s` — she should
+   surface fullscreen, fish and all.
 
-## Bonus: wiring it up as an actual Linux screensaver (xscreensaver)
+## Bonus: making her your actual watch (xscreensaver)
 
-Cinnamon (and most modern DEs) dropped support for embedding raw
-xscreensaver "hacks" natively, so the practical way to get idle-triggered
-behavior + locking is to let `xscreensaver` own both (disable your DE's
-competing idle-activation so the two don't fight over the same X11 idle
-timer). See `xscreensaver-hack-wrapper.sh` for the launch wrapper referenced
-from `~/.xscreensaver`'s `programs:` list.
+Cinnamon (and most modern desktops) dropped support for embedding raw
+xscreensaver "hacks" natively, so the practical rig for idle-triggered
+behavior + screen-locking is to let `xscreensaver` run both jobs — switch
+off your desktop's own competing idle-activation first, so the two crews
+aren't fighting over the same wheel. See `xscreensaver-hack-wrapper.sh` for
+the launch wrapper referenced from `~/.xscreensaver`'s `programs:` list.
 
-## Files
+## Ship's manifest
 
-- `patch_dream_aquarium.py` — the patch script (verify + patch + backup)
-- `xscreensaver-hack-wrapper.sh` — example wrapper for xscreensaver integration
+- `patch_dream_aquarium.py` — the fix (verify, patch, and a backup before
+  anyone touches the hull)
+- `xscreensaver-hack-wrapper.sh` — example wrapper for xscreensaver duty
+
+Fair winds. 🐠
