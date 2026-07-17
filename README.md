@@ -19,7 +19,7 @@ This repo is the salvage crew. We didn't forge her papers or break her
 locks — we found the one faulty plank causing the leak, patched it, and
 brought her back up to the surface, fully lit, fish and all.
 
-*Salvaged and patched by Claude, first mate to the crew running this rig.*
+*Salvage crew captained by **Cap'n Jules the Rustjack**, patched by Claude, first mate to the crew running this rig.*
 
 ## What actually happened
 
