@@ -119,6 +119,7 @@ screensaver** under Linux is a second fight. Stock gotchas:
 | Solid Windows-blue flash then fish | `wine explorer /desktop=...` | **Don't** — launch `DreamAquarium.scr /s` directly |
 | Password box covers fish at t=0 | xscreensaver always spawns auth when locked | Park/unmap dialog until real key/click |
 | Dialog reappears ~2s after hide | xdotool injects XTEST → looks like "user input" | Pure Xlib park; ignore XTEST + Consumer Control |
+| **Stuck lock — fish, no unlock UI** | auth-hide exited early (Wine *launcher* PID died, or one-shot input wait ended) while dialog still unmapped / under tank | Keep helper alive while blanked **or** `.scr` up **or** min-hold; re-arm wait; force-unpark on exit/SIGTERM; wrapper waits on tank engine (not launcher) and never `pkill -f` auth-hide |
 | Can't click tank options while locked | Input grab belongs to locker | Configure tank unlocked; or delay lock (`lockTimeout`) |
 
 ### Files
@@ -171,6 +172,7 @@ Wine window into that drawable. Logs: `/tmp/dream-aquarium-hack.log`.
 | `DREAM_AQUARIUM_SOUND` | `1` | `0` mutes tank audio via null Pulse sink |
 | `DREAM_AQUARIUM_LOG` | `/tmp/dream-aquarium-hack.log` | Log path |
 | `AUTH_HIDE_GRACE` | `8.0` | Seconds after start to ignore settle/XTEST noise |
+| `AUTH_HIDE_MIN_HOLD` | `45.0` | Minimum seconds auth-hide stays up (covers startup races before blanked/`.scr` checks settle) |
 | `AUTH_HIDE_PY` | auto next to wrapper | Override path to the hide helper |
 | `AUTH_ALLOW_SUBSTR` | `mouse,keyboard,ares,logi` | Comma list of xinput name tokens treated as real login devices |
 | `WINEPREFIX` | `$HOME/.wine` | Wine prefix |
@@ -192,9 +194,19 @@ Current helper:
 - Ignores XTEST, Consumer Control, power/WMI, and motion
 - Grace period covers Wine launch + reparent + lock settle
 - Never unmaps the daemon window (size/name guards)
+- Stays alive while **xscreensaver is blanked**, the **`.scr` engine** is up, or **min-hold** has not elapsed — never gates lifecycle on the short-lived Wine launcher PID alone
+- Re-arms the input wait if xinput ends while still blanked; **force-unparks** on exit / SIGTERM so a dead helper cannot leave the password box unmapped under the tank
+- Wrapper tracks / waits on the real tank process, restarts auth-hide if it dies while the tank is still up, and only kills **its own** helper PID (no global `pkill -f`)
 
 Screen **stays locked** the whole time; only the dialog chrome is hidden
 until a deliberate press.
+
+**Emergency unlock** if something still sticks (TTY, no full logout):
+
+```bash
+# Ctrl+Alt+F3, login, then:
+DISPLAY=:0 xscreensaver-command -deactivate
+```
 
 ### Recommended lock policy
 

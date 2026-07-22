@@ -356,15 +356,96 @@ def show_centered(d: display.Display, sw: int, sh: int, wids: list[int]) -> None
             pass
 
 
-def wine_alive() -> bool:
-    wine_pid = os.environ.get("AQUARIUM_WINE_PID")
-    if not wine_pid:
-        return True
+# Set in main(); used so we never die in the first seconds of a blank.
+_STARTED_AT = 0.0
+# Hold at least this long even if blanked/tank checks race at startup.
+_MIN_HOLD_S = float(os.environ.get("AUTH_HIDE_MIN_HOLD", "45.0"))
+
+
+def _proc_cmdline_has(sub: str) -> bool:
+    sub_l = sub.lower()
     try:
-        os.kill(int(wine_pid), 0)
-        return True
+        for ent in os.listdir("/proc"):
+            if not ent.isdigit():
+                continue
+            try:
+                with open(f"/proc/{ent}/cmdline", "rb") as f:
+                    cl = f.read().replace(b"\x00", b" ").decode("utf-8", "replace").lower()
+                if sub_l in cl:
+                    return True
+            except OSError:
+                continue
     except OSError:
+        pass
+    return False
+
+
+def aquarium_running() -> bool:
+    """True if the tank engine is still up (not just the wine *launcher* PID).
+
+    Wine 9 often exits the shell-facing `wine` wrapper immediately after
+    spawning wineserver + the .scr. Gating on AQUARIUM_WINE_PID alone made
+    auth-hide exit in <1s with the password dialog still unmapped → stuck
+    screensaver (no unlock UI).
+    """
+    wine_pid = os.environ.get("AQUARIUM_WINE_PID")
+    if wine_pid:
+        try:
+            os.kill(int(wine_pid), 0)
+            return True
+        except (OSError, ValueError):
+            pass
+    # Real engine only — match the .scr binary, NOT free text like
+    # "dream-aquarium-hack.sh" in a shell cmdline (that false-positive
+    # kept session_alive stuck True during unrelated agent shells).
+    for needle in (
+        "dreamaquarium.scr",
+        "dream_aquarium.scr",
+    ):
+        if _proc_cmdline_has(needle):
+            return True
+    return False
+
+
+def saver_blanked() -> bool:
+    """True while xscreensaver is actively blanked/locked."""
+    try:
+        out = subprocess.check_output(
+            ["xscreensaver-command", "-time"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+        ).lower()
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        # If we cannot ask, assume still blanked so we don't abandon parked UI.
+        return True
+    # "screen blanked since …" vs "screen non-blanked since …"
+    if "non-blanked" in out:
         return False
+    return "blanked" in out
+
+
+def session_alive() -> bool:
+    """Keep auth-hide alive while tank runs OR saver still blanked OR min-hold.
+
+    Exiting early while blanked leaves a parked (unmapped) unlock dialog —
+    the classic "screensaver stuck on screen" failure. Also stay up during
+    the first AUTH_HIDE_MIN_HOLD seconds so a startup race (wine launcher
+    dead, xscreensaver not yet reporting blanked, tank not yet in /proc)
+    cannot abort the unlock helper.
+    """
+    if _STARTED_AT and (time.time() - _STARTED_AT) < _MIN_HOLD_S:
+        return True
+    if aquarium_running():
+        return True
+    if saver_blanked():
+        return True
+    return False
+
+
+# Back-compat alias for any external callers
+def wine_alive() -> bool:
+    return session_alive()
 
 
 def wait_real_login_input(grace: float, stop: threading.Event, names: dict[int, str]) -> str | None:
@@ -394,7 +475,7 @@ def wait_real_login_input(grace: float, stop: threading.Event, names: dict[int, 
     try:
         assert proc.stdout is not None
         for line in proc.stdout:
-            if stop.is_set() or not wine_alive():
+            if stop.is_set() or not session_alive():
                 break
             line = line.strip()
             if "EVENT type" in line:
@@ -479,7 +560,7 @@ def wait_fallback_click(grace: float, stop: threading.Event) -> str | None:
     d = display.Display(os.environ.get("DISPLAY", ":0"))
     root = d.screen().root
     t0 = time.time()
-    while not stop.is_set() and wine_alive():
+    while not stop.is_set() and session_alive():
         if time.time() - t0 < grace:
             time.sleep(0.05)
             continue
@@ -493,7 +574,23 @@ def wait_fallback_click(grace: float, stop: threading.Event) -> str | None:
     return None
 
 
+def force_unpark_auth(d: display.Display, sw: int, sh: int, why: str) -> None:
+    """ALWAYS restore unlock UI if we may have parked it — never leave saver stuck."""
+    try:
+        ids = window_ids_for_auth(d)
+        if ids:
+            log(f"force-unpark ({why}): {[hex(i) for i in ids]}")
+            show_centered(d, sw, sh, ids)
+        else:
+            log(f"force-unpark ({why}): no auth windows found")
+    except Exception as e:
+        log(f"force-unpark ({why}) error: {e!r}")
+
+
 def main() -> int:
+    global _STARTED_AT
+    _STARTED_AT = time.time()
+
     dpy_name = os.environ.get("DISPLAY", ":0")
     d = display.Display(dpy_name)
     sw = d.screen().width_in_pixels
@@ -505,7 +602,8 @@ def main() -> int:
     login_devs = {i: n for i, n in names.items() if is_login_device(i, names)}
     log(
         f"start DISPLAY={dpy_name} screen={sw}x{sh} grace={grace}s "
-        f"login_devs={login_devs}"
+        f"min_hold={_MIN_HOLD_S}s login_devs={login_devs} "
+        f"aqua={aquarium_running()} blanked={saver_blanked()}"
     )
 
     stop = threading.Event()
@@ -515,7 +613,7 @@ def main() -> int:
     def parker() -> None:
         """Continuously unmap/park auth dialogs until revealed or stop."""
         last_ids: list[int] = []
-        while not stop.is_set() and wine_alive() and not revealed.is_set():
+        while not stop.is_set() and session_alive() and not revealed.is_set():
             ids = window_ids_for_auth(d)
             if ids:
                 if ids != last_ids:
@@ -530,31 +628,77 @@ def main() -> int:
     park_thread = threading.Thread(target=parker, name="auth-parker", daemon=True)
     park_thread.start()
 
-    reason = wait_real_login_input(grace, stop, names)
-    if not wine_alive():
-        log("wine gone — exit before show")
+    def _safe_unpark(why: str) -> None:
+        # Always attempt restore while blanked — even parks=0 (dialog under tank).
+        if saver_blanked() or aquarium_running():
+            force_unpark_auth(d, sw, sh, why)
+
+    # SIGTERM from wrapper cleanup must unpark before die (logout was the only
+    # escape when we exited with the dialog still unmapped / under the tank).
+    def _on_signal(signum, _frame) -> None:
+        log(f"signal {signum} — force unpark then exit")
         stop.set()
-        return 0
+        try:
+            _safe_unpark(f"signal-{signum}")
+        except Exception:
+            pass
+        # Do not sys.exit here — let main finally run.
 
-    if reason:
-        log(f"REAL input {reason} — show unlock dialog (parks={park_count['n']})")
-        revealed.set()
-        time.sleep(0.1)
-        for _ in range(16):
-            ids = window_ids_for_auth(d)
-            if ids:
-                show_centered(d, sw, sh, ids)
-            time.sleep(0.06)
-        while wine_alive():
-            ids = window_ids_for_auth(d)
-            if ids:
-                show_centered(d, sw, sh, ids)
-            time.sleep(0.25)
-    else:
-        log("input wait ended without press")
+    try:
+        import signal as _signal
 
-    stop.set()
-    log("exit")
+        _signal.signal(_signal.SIGTERM, _on_signal)
+        _signal.signal(_signal.SIGHUP, _on_signal)
+    except Exception:
+        pass
+
+    try:
+        # Re-arm input wait if xinput dies while still blanked/tank-up.
+        # One-shot wait was the stuck-screensaver bug: helper exited, fish
+        # covered the password box, no one left to raise it on keypress.
+        reason = None
+        while not stop.is_set() and session_alive() and not revealed.is_set():
+            reason = wait_real_login_input(grace, stop, names)
+            if reason:
+                break
+            if not session_alive() or stop.is_set():
+                break
+            log(
+                "input wait returned empty but session still alive — "
+                f"re-arm (parks={park_count['n']} aqua={aquarium_running()} "
+                f"blanked={saver_blanked()})"
+            )
+            time.sleep(0.2)
+            # After first arm, grace already elapsed for the user
+            grace = 0.0
+
+        if reason:
+            log(f"REAL input {reason} — show unlock dialog (parks={park_count['n']})")
+            revealed.set()
+            time.sleep(0.1)
+            for _ in range(16):
+                ids = window_ids_for_auth(d)
+                if ids:
+                    show_centered(d, sw, sh, ids)
+                time.sleep(0.06)
+            # Keep dialog visible while blanked/tank runs
+            while session_alive() and not stop.is_set():
+                ids = window_ids_for_auth(d)
+                if ids:
+                    show_centered(d, sw, sh, ids)
+                time.sleep(0.25)
+        else:
+            log(
+                f"input wait ended without press "
+                f"(parks={park_count['n']} aqua={aquarium_running()} "
+                f"blanked={saver_blanked()})"
+            )
+            _safe_unpark("wait-ended")
+    finally:
+        stop.set()
+        if not revealed.is_set():
+            _safe_unpark("finally")
+        log("exit")
     return 0
 
 
@@ -562,4 +706,15 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except KeyboardInterrupt:
+        # Emergency: unpark before die
+        try:
+            dpy = display.Display(os.environ.get("DISPLAY", ":0"))
+            force_unpark_auth(
+                dpy,
+                dpy.screen().width_in_pixels,
+                dpy.screen().height_in_pixels,
+                "KeyboardInterrupt",
+            )
+        except Exception:
+            pass
         sys.exit(0)
