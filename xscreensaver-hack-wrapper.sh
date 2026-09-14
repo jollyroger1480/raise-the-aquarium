@@ -245,8 +245,34 @@ tank_alive() {
   return 1
 }
 
+xss_blanked() {
+  # True while xscreensaver reports actively blanked (not "non-blanked").
+  local t
+  t=$(xscreensaver-command -time 2>/dev/null || true)
+  case "$t" in
+    *non-blanked*) return 1 ;;
+    *blanked*) return 0 ;;
+  esac
+  return 0
+}
+
+SAW_BLANKED=0
+xss_unblanked_after_lock() {
+  # Wine .scr outlives xss unblank on XWayland (window reparented, then
+  # orphaned onto the root). That is the stuck-on-desktop hang.
+  if xss_blanked; then
+    SAW_BLANKED=1
+    return 1
+  fi
+  [ "${SAW_BLANKED:-0}" -eq 1 ]
+}
+
 if [ "$REPARENTED" -eq 0 ] && [ -n "$FOUND" ]; then
   while tank_alive; do
+    if xss_unblanked_after_lock; then
+      log "xscreensaver unblanked — stop raise loop"
+      break
+    fi
     # Stop raising once user revealed unlock (auth-hide owns stacking).
     if [ -f /tmp/dream-aquarium-show-auth ]; then
       break
@@ -258,6 +284,10 @@ fi
 
 # Wait for the tank engine — NOT only the wine launcher (which often exits first).
 while tank_alive; do
+  if xss_unblanked_after_lock; then
+    log "xscreensaver unblanked — stop leftover tank"
+    break
+  fi
   # If auth-hide died while still blanked, restart it (belt-and-suspenders).
   if [ -n "${AUTH_HIDE_PID:-}" ] && [ -f "$AUTH_HIDE_PY" ]; then
     if ! kill -0 "$AUTH_HIDE_PID" 2>/dev/null; then

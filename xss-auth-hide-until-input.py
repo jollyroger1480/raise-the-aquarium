@@ -21,7 +21,6 @@ import time
 from Xlib import X, display
 from Xlib.error import BadWindow
 
-
 OFF_X, OFF_Y = 200000, 200000
 
 # Always ignore: masters + XTEST
@@ -49,6 +48,10 @@ _DEFAULT_ALLOW = (
     "keyboard",       # main "Usb KeyBoard …" — NOT "Consumer Control"
     "ares",           # Cooler Master ARES (example; override via env if unwanted)
     "logi",           # Logitech mice/keyboards
+    # KDE/Plasma Wayland: HID is only visible as XWayland virtual devices.
+    # Clicks arrive on xwayland-pointer / xwayland-relative-pointer, not "mouse".
+    "xwayland-pointer:",
+    "xwayland-relative-pointer",
 )
 _env_allow = os.environ.get("AUTH_ALLOW_SUBSTR", "").strip()
 if _env_allow:
@@ -360,6 +363,9 @@ def show_centered(d: display.Display, sw: int, sh: int, wids: list[int]) -> None
 _STARTED_AT = 0.0
 # Hold at least this long even if blanked/tank checks race at startup.
 _MIN_HOLD_S = float(os.environ.get("AUTH_HIDE_MIN_HOLD", "45.0"))
+# Once xss has reported blanked, a later non-blanked means the lock ended.
+# Leftover Wine .scr must not keep this helper (or the tank) alive.
+_SAW_BLANKED = False
 
 
 def _proc_cmdline_has(sub: str) -> bool:
@@ -426,19 +432,26 @@ def saver_blanked() -> bool:
 
 
 def session_alive() -> bool:
-    """Keep auth-hide alive while tank runs OR saver still blanked OR min-hold.
+    """Keep auth-hide alive while the *lock* is up.
 
     Exiting early while blanked leaves a parked (unmapped) unlock dialog —
-    the classic "screensaver stuck on screen" failure. Also stay up during
-    the first AUTH_HIDE_MIN_HOLD seconds so a startup race (wine launcher
-    dead, xscreensaver not yet reporting blanked, tank not yet in /proc)
-    cannot abort the unlock helper.
+    the classic "screensaver stuck on screen" failure.
+
+    The other hang (2026-09-14): xscreensaver already unblanked, but Wine
+    .scr was still in /proc so we stayed alive and the tank covered the
+    desktop. After we have seen a blanked lock, non-blanked means done —
+    leftover aquarium is not a reason to keep parking/raising.
     """
-    if _STARTED_AT and (time.time() - _STARTED_AT) < _MIN_HOLD_S:
+    global _SAW_BLANKED
+    blanked = saver_blanked()
+    if blanked:
+        _SAW_BLANKED = True
         return True
+    if _SAW_BLANKED:
+        return False
     if aquarium_running():
         return True
-    if saver_blanked():
+    if _STARTED_AT and (time.time() - _STARTED_AT) < _MIN_HOLD_S:
         return True
     return False
 
@@ -668,7 +681,9 @@ def main() -> int:
                 f"re-arm (parks={park_count['n']} aqua={aquarium_running()} "
                 f"blanked={saver_blanked()})"
             )
-            time.sleep(0.2)
+            # XWayland xinput test-xi2 often exits immediately during grab/reparent.
+            # Do not spin at 5 Hz (2026-09-14 log storm).
+            time.sleep(1.0)
             # After first arm, grace already elapsed for the user
             grace = 0.0
 
