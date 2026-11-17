@@ -1,5 +1,7 @@
 # 🏴‍☠️ Raise the Aquarium
 
+![A dark room with a desk monitor showing a glowing tropical-fish aquarium, a night harbour visible through the window](docs/banner.webp)
+
 *A salvage operation, not a heist — no cracks, no keygens, just an honest fix
 for an honest bug.*
 
