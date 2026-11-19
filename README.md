@@ -5,6 +5,8 @@
 *A salvage operation, not a heist — no cracks, no keygens, just an honest fix
 for an honest bug.*
 
+Free to use. If it saved you time, tips are welcome: [Cash App](https://cash.app/$jollyroger1480) or Bitcoin `bc1qydycnf5pjhez5d0mrgmmumyv2g5nc63mwet89j`. More links at the [bottom](#support-and-links).
+
 Ahoy. Somewhere out there a fine ship called **Dream Aquarium** — a legally
 purchased, perfectly legitimate v1.x Windows screensaver — ran aground the
 moment she tried to sail under Wine. She'd take on her cargo, check her
@@ -22,8 +24,6 @@ locks — we found the one faulty plank causing the leak, patched it, and
 brought her back up to the surface, fully lit, fish and all.
 
 *Salvage crew captained by **Cap'n Jules the Rustjack**.*
-
-Free to use. If it saved you time, tips are welcome: [Cash App](https://cash.app/$jollyroger1480) or Bitcoin `bc1qydycnf5pjhez5d0mrgmmumyv2g5nc63mwet89j`. More links at the [bottom](#support-and-links).
 
 ## What actually happened
 
