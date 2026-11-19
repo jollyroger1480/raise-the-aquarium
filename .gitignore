@@ -1,2 +1,4 @@
 __pycache__/
 *.pyc
+wl-idle/aquarium-wl-idle
+tests/saver-proof-*.log

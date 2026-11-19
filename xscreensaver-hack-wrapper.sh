@@ -57,16 +57,62 @@ ensure_silent_sink() {
   return 0
 }
 
+tank_pids() {
+  # Bracketed first letters: the old /explorer.*DreamAq|desktop=DreamAq/
+  # matched this awk's own command line, so every kill hit a phantom pid.
+  ps -eo pid=,args= | awk '
+    BEGIN{IGNORECASE=1}
+    /[D]reamAquarium\.scr|[D]ream_Aquarium\.scr|[e]xplorer.*DreamAq|[d]esktop=DreamAq/ {print $1}
+  '
+}
+
+# xscreensaver restarts the hack every `cycle` (SIGTERM old, start new at
+# once). Tank processes are matched by name, so an old copy cleaning up late
+# would kill the NEW copy's fish. Only the newest copy may kill by name.
+OWNER_FILE="${DREAM_AQUARIUM_OWNER_FILE:-/tmp/dream-aquarium-owner}"
+i_own_tank() { [ "$(cat "$OWNER_FILE" 2>/dev/null)" = "$$" ]; }
+
+# Wine ignores TERM often enough that the bubbles keep playing after the
+# desktop is back. Mute the stream first, then KILL whatever is left.
+mute_tank_audio() {
+  command -v pactl >/dev/null 2>&1 || return 0
+  pactl list sink-inputs 2>/dev/null | awk '
+    /^Sink Input #/ { id=$3; sub(/^#/, "", id) }
+    /application.process.binary|application.name|application.process.command/ {
+      line=tolower($0)
+      if (id != "" && line ~ /wine|dream|aquarium/) { print id; id="" }
+    }
+  ' | while read -r id; do
+    pactl set-sink-input-mute "$id" 1 >/dev/null 2>&1 || true
+    pactl set-sink-input-volume "$id" 0 >/dev/null 2>&1 || true
+  done
+}
+
+kill_tank_procs() {
+  local pids
+  pids=$(tank_pids)
+  [ -n "$pids" ] || return 0
+  log "stopping tank pids: $pids"
+  mute_tank_audio
+  # shellcheck disable=SC2086
+  kill -TERM $pids 2>/dev/null || true
+  sleep 0.25
+  pids=$(tank_pids)
+  if [ -n "$pids" ]; then
+    log "tank still alive — KILL $pids"
+    # shellcheck disable=SC2086
+    kill -KILL $pids 2>/dev/null || true
+  fi
+}
+
 kill_old_aquarium() {
   local pids
-  pids=$(ps -eo pid=,args= | awk '
-    BEGIN{IGNORECASE=1}
-    /DreamAquarium\.scr|Dream_Aquarium\.scr|explorer.*DreamAq|desktop=DreamAq/ {print $1}
-  ')
+  pids=$(tank_pids)
   if [ -n "$pids" ]; then
     log "killing prior aquarium pids: $pids"
+    mute_tank_audio
     # shellcheck disable=SC2086
-    kill $pids 2>/dev/null || true
+    kill -KILL $pids 2>/dev/null || true
     sleep 0.25
   fi
 }
@@ -92,7 +138,8 @@ pick_best_window() {
 log "start DISPLAY=$DISPLAY TARGET=${TARGET:-none} SOUND=$DREAM_AQUARIUM_SOUND"
 
 kill_old_aquarium
-rm -f /tmp/dream-aquarium-show-auth
+echo "$$" >"$OWNER_FILE"
+rm -f /tmp/dream-aquarium-show-auth /tmp/dream-aquarium-user-back
 
 if [ "$DREAM_AQUARIUM_SOUND" = "0" ]; then
   if ensure_silent_sink; then
@@ -155,12 +202,20 @@ cleanup() {
   fi
   kill "$WPID" 2>/dev/null || true
   pkill -P "$WPID" 2>/dev/null || true
-  # leftover scr if wine parent already gone
-  pids=$(ps -eo pid=,args= | awk 'BEGIN{IGNORECASE=1} /DreamAquarium\.scr|Dream_Aquarium\.scr/ {print $1}')
-  # shellcheck disable=SC2086
-  [ -n "$pids" ] && kill $pids 2>/dev/null || true
+  if i_own_tank; then
+    kill_tank_procs
+    rm -f /tmp/dream-aquarium-user-back "$OWNER_FILE"
+  else
+    log "newer hack owns the tank — leave its fish alone"
+  fi
 }
-trap cleanup EXIT INT TERM HUP
+# A signal must END the hack. The old `trap cleanup ... TERM` ran cleanup and
+# then carried on looping, so every cycle left a zombie copy behind (xss:
+# "sent SIGTERM 600 seconds ago and did not die") that later killed the fish.
+trap cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+trap 'exit 129' HUP
 
 # Start hide ASAP — reparent/xdotool uses XTEST and used to unpark the dialog.
 # Grace ignores synthetic + settle noise; only real key/click after grace shows box.
@@ -267,26 +322,61 @@ xss_unblanked_after_lock() {
   [ "${SAW_BLANKED:-0}" -eq 1 ]
 }
 
+# Wayland typing never reaches X, so xss stays "blanked" and the fish keep
+# bubbling over the desktop. Seat input asks xss to deactivate. If xss is
+# still locked afterwards, cut the audio but keep THIS process alive —
+# exiting while blanked makes xss launch another tank.
+HOLD_FOR_XSS=0
+on_user_back() {
+  [ -f /tmp/dream-aquarium-user-back ] || return 1
+  log "seat input while saver up — deactivate"
+  rm -f /tmp/dream-aquarium-user-back
+  xscreensaver-command -deactivate >/dev/null 2>&1 || true
+  if xss_blanked && i_own_tank; then
+    log "still blanked after deactivate — cut tank audio and hold"
+    mute_tank_audio
+    kill_tank_procs
+    HOLD_FOR_XSS=1
+  fi
+  return 0
+}
+
 if [ "$REPARENTED" -eq 0 ] && [ -n "$FOUND" ]; then
-  while tank_alive; do
+  while tank_alive || [ "$HOLD_FOR_XSS" -eq 1 ]; do
     if xss_unblanked_after_lock; then
       log "xscreensaver unblanked — stop raise loop"
       break
     fi
+    on_user_back || true
     # Stop raising once user revealed unlock (auth-hide owns stacking).
     if [ -f /tmp/dream-aquarium-show-auth ]; then
       break
     fi
-    xdotool windowraise "$FOUND" 2>/dev/null || true
+    if [ "$HOLD_FOR_XSS" -eq 0 ]; then
+      xdotool windowraise "$FOUND" 2>/dev/null || true
+    fi
     sleep 2
   done
 fi
 
 # Wait for the tank engine — NOT only the wine launcher (which often exits first).
-while tank_alive; do
+# Stay up while xss is still blanked after we killed a crashed/stuck tank,
+# otherwise xss relaunches the hack and the sound comes straight back.
+while true; do
   if xss_unblanked_after_lock; then
     log "xscreensaver unblanked — stop leftover tank"
     break
+  fi
+  on_user_back || true
+  if ! tank_alive; then
+    if [ "${SAW_BLANKED:-0}" -eq 1 ] && xss_blanked; then
+      if [ "$HOLD_FOR_XSS" -eq 0 ]; then
+        log "tank died while still blanked — hold so xss does not relaunch"
+        HOLD_FOR_XSS=1
+      fi
+    else
+      break
+    fi
   fi
   # If auth-hide died while still blanked, restart it (belt-and-suspenders).
   if [ -n "${AUTH_HIDE_PID:-}" ] && [ -f "$AUTH_HIDE_PY" ]; then
