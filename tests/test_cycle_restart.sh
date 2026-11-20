@@ -57,6 +57,10 @@ chmod +x "$W/bin/"*
 
 export PATH="$W/bin:$PATH" AUTH_HIDE_PY="$W/auth.py" XSCREENSAVER_WINDOW=0x1
 export DREAM_AQUARIUM_LOG="$W/hack.log" DISPLAY=:99
+# Private runtime dir: flag files must land here, never in shared /tmp.
+mkdir -m 700 "$W/run"; export XDG_RUNTIME_DIR="$W/run"
+unset DREAM_AQUARIUM_STATE_DIR DREAM_AQUARIUM_OWNER_FILE DREAM_AQUARIUM_USER_BACK
+TMP_OWNER_BEFORE=$(stat -c %Y /tmp/dream-aquarium-owner 2>/dev/null || echo none)
 
 # Tag goes in via ENVIRON and the regex is bracketed so awk never matches itself.
 tank() { ps -eo pid=,args= | T="$TAG" awk 'index($0,ENVIRON["T"]) && /[D]reamAquarium/ {print $1}'; }
@@ -79,6 +83,20 @@ if alive "$A"; then echo "FAIL: hack A ignored SIGTERM (still running 6s later)"
 else echo "ok: hack A exited on SIGTERM"; fi
 if [ -z "$TB" ]; then echo "FAIL: new hack B has no tank (fish gone after cycle)"; fail=1
 else echo "ok: hack B tank alive ($TB)"; fi
+
+SD="$W/run/dream-aquarium"
+if [ -d "$SD" ] && [ "$(stat -c %a "$SD")" = 700 ] && [ "$(cat "$SD/owner" 2>/dev/null)" = "$B" ]; then
+  echo "ok: owner flag in private runtime dir (0700, holds B)"
+else echo "FAIL: owner flag not in private runtime dir"; fail=1; fi
+if [ "$(stat -c %Y /tmp/dream-aquarium-owner 2>/dev/null || echo none)" != "$TMP_OWNER_BEFORE" ]; then
+  echo "FAIL: hack wrote /tmp/dream-aquarium-owner"; fail=1
+else echo "ok: nothing written to /tmp flag names"; fi
+# seat input flag goes where auth-hide is told to write it
+: >"$SD/user-back"
+sleep 3
+if [ -e "$SD/user-back" ]; then echo "FAIL: user-back flag in runtime dir not consumed"; fail=1
+else echo "ok: user-back flag read from runtime dir"; fi
+echo blanked >"$STATE"
 
 echo non-blanked >"$STATE"
 sleep 4

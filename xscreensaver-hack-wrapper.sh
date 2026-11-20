@@ -26,6 +26,28 @@ if [ -z "$AUTH_HIDE_PY" ]; then
 fi
 
 LOG="${DREAM_AQUARIUM_LOG:-/tmp/dream-aquarium-hack.log}"
+
+# Flag files live in a private per-user dir, not shared /tmp (another user
+# could pre-create or symlink /tmp names). $XDG_RUNTIME_DIR if it is ours,
+# else ~/.cache. The dir must be a real directory we own, mode 0700.
+private_dir_ok() { [ -d "$1" ] && [ ! -L "$1" ] && [ -O "$1" ]; }
+STATE_DIR="${DREAM_AQUARIUM_STATE_DIR:-}"
+if [ -z "$STATE_DIR" ]; then
+  if [ -n "${XDG_RUNTIME_DIR:-}" ] && private_dir_ok "$XDG_RUNTIME_DIR"; then
+    STATE_DIR="$XDG_RUNTIME_DIR/dream-aquarium"
+  else
+    STATE_DIR="$HOME/.cache/dream-aquarium"
+  fi
+fi
+mkdir -p -m 700 "$STATE_DIR" 2>/dev/null
+if ! private_dir_ok "$STATE_DIR"; then
+  STATE_DIR="$(mktemp -d)"   # private 0700 dir as a last resort
+fi
+chmod 700 "$STATE_DIR"
+# auth-hide (child) writes this flag when seat input arrives.
+export DREAM_AQUARIUM_USER_BACK="$STATE_DIR/user-back"
+USER_BACK_FLAG="$DREAM_AQUARIUM_USER_BACK"
+SHOW_AUTH_FLAG="$STATE_DIR/show-auth"
 SCR='C:\windows\DreamAquarium.scr'
 TARGET="${XSCREENSAVER_WINDOW:-}"
 
@@ -69,7 +91,7 @@ tank_pids() {
 # xscreensaver restarts the hack every `cycle` (SIGTERM old, start new at
 # once). Tank processes are matched by name, so an old copy cleaning up late
 # would kill the NEW copy's fish. Only the newest copy may kill by name.
-OWNER_FILE="${DREAM_AQUARIUM_OWNER_FILE:-/tmp/dream-aquarium-owner}"
+OWNER_FILE="${DREAM_AQUARIUM_OWNER_FILE:-$STATE_DIR/owner}"
 i_own_tank() { [ "$(cat "$OWNER_FILE" 2>/dev/null)" = "$$" ]; }
 
 # Wine ignores TERM often enough that the bubbles keep playing after the
@@ -139,7 +161,7 @@ log "start DISPLAY=$DISPLAY TARGET=${TARGET:-none} SOUND=$DREAM_AQUARIUM_SOUND"
 
 kill_old_aquarium
 echo "$$" >"$OWNER_FILE"
-rm -f /tmp/dream-aquarium-show-auth /tmp/dream-aquarium-user-back
+rm -f "$SHOW_AUTH_FLAG" "$USER_BACK_FLAG"
 
 if [ "$DREAM_AQUARIUM_SOUND" = "0" ]; then
   if ensure_silent_sink; then
@@ -204,7 +226,7 @@ cleanup() {
   pkill -P "$WPID" 2>/dev/null || true
   if i_own_tank; then
     kill_tank_procs
-    rm -f /tmp/dream-aquarium-user-back "$OWNER_FILE"
+    rm -f "$USER_BACK_FLAG" "$OWNER_FILE"
   else
     log "newer hack owns the tank — leave its fish alone"
   fi
@@ -328,9 +350,9 @@ xss_unblanked_after_lock() {
 # exiting while blanked makes xss launch another tank.
 HOLD_FOR_XSS=0
 on_user_back() {
-  [ -f /tmp/dream-aquarium-user-back ] || return 1
+  [ -f "$USER_BACK_FLAG" ] || return 1
   log "seat input while saver up — deactivate"
-  rm -f /tmp/dream-aquarium-user-back
+  rm -f "$USER_BACK_FLAG"
   xscreensaver-command -deactivate >/dev/null 2>&1 || true
   if xss_blanked && i_own_tank; then
     log "still blanked after deactivate — cut tank audio and hold"
@@ -349,7 +371,7 @@ if [ "$REPARENTED" -eq 0 ] && [ -n "$FOUND" ]; then
     fi
     on_user_back || true
     # Stop raising once user revealed unlock (auth-hide owns stacking).
-    if [ -f /tmp/dream-aquarium-show-auth ]; then
+    if [ -f "$SHOW_AUTH_FLAG" ]; then
       break
     fi
     if [ "$HOLD_FOR_XSS" -eq 0 ]; then

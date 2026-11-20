@@ -3,7 +3,7 @@
 Holds a real inhibit (as mpv/Chrome/Firefox do), waits for KDE's PolicyAgent
 to register it (~5 s delay), and checks the guard's probe reports it, then
 releases it and checks it is gone. Touches nothing on screen.
-Run: python3 tests/test_dbus_inhibit_seen.py
+Run: python3 tests/live_dbus_inhibit_seen.py
 """
 import importlib.util, os, sys, time
 import dbus

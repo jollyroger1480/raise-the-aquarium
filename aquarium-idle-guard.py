@@ -23,7 +23,12 @@ While busy and the saver is not up, it pokes `xscreensaver-command -deactivate`
 (resets xscreensaver's idle timer). If an inhibitor appears while the saver is
 up, it deactivates the saver.
 
-Log: /tmp/aquarium-idle-guard.log (state changes only).
+If the aquarium-wl-idle helper is missing, cannot connect, or keeps dying,
+its state is ignored (never treated as "busy"), so the saver and the lock
+still work from the other signals.
+
+Log: $XDG_RUNTIME_DIR/aquarium-idle-guard.log (else ~/.cache), mode 0600,
+state changes only.
 """
 import fcntl
 import json
@@ -33,18 +38,55 @@ import sys
 import threading
 import time
 
+def private_dir():
+    """$XDG_RUNTIME_DIR if it is a real dir we own, else ~/.cache."""
+    xdg = os.environ.get("XDG_RUNTIME_DIR", "")
+    if xdg and os.path.isdir(xdg) and not os.path.islink(xdg) \
+            and os.stat(xdg).st_uid == os.getuid():
+        return xdg
+    d = os.path.join(os.path.expanduser("~"), ".cache")
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    return d
+
+
 POLL = float(os.environ.get("AQUARIUM_GUARD_POLL", "10"))
 WL_TIMEOUT_MS = int(os.environ.get("AQUARIUM_GUARD_WL_TIMEOUT_MS", "30000"))
-LOG = os.environ.get("AQUARIUM_GUARD_LOG", "/tmp/aquarium-idle-guard.log")
+WL_RESPAWN = float(os.environ.get("AQUARIUM_GUARD_WL_RESPAWN", "60"))
+LOG = os.environ.get("AQUARIUM_GUARD_LOG") or \
+    os.path.join(private_dir(), "aquarium-idle-guard.log")
 HERE = os.path.dirname(os.path.abspath(__file__))
 WL_HELPER = os.environ.get("AQUARIUM_WL_IDLE",
                            os.path.join(HERE, "aquarium-wl-idle"))
 CHANGE_SCREEN_SETTINGS = 4  # PowerDevil PolicyAgent policy bit
 
 
+def clean(text, limit=None):
+    """Printable one-line text: app-supplied names may carry newlines."""
+    s = "".join(c if c.isprintable() else "?" for c in str(text))
+    return s[:limit] if limit else s
+
+
+def open_private(path, flags):
+    """Open without following a symlink; owner-only; refuse others' files."""
+    fd = os.open(path, flags | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+                 0o600)
+    if os.fstat(fd).st_uid != os.getuid():
+        os.close(fd)
+        raise PermissionError(f"{path} not owned by this user")
+    os.fchmod(fd, 0o600)
+    return fd
+
+
 def log(msg):
-    with open(LOG, "a") as f:
-        f.write(time.strftime("%H:%M:%S ") + msg + "\n")
+    line = time.strftime("%H:%M:%S ") + clean(msg) + "\n"
+    try:
+        fd = open_private(LOG, os.O_WRONLY | os.O_APPEND)
+    except OSError:
+        return
+    try:
+        os.write(fd, line.encode())
+    finally:
+        os.close(fd)
 
 
 # ---------------------------------------------------------------- decision
@@ -104,7 +146,8 @@ class Inhibitors:
             if pa.HasInhibition(d.UInt32(CHANGE_SCREEN_SETTINGS),
                                 dbus_interface=iface):
                 lst = pa.ListInhibitions(dbus_interface=iface)
-                names += [str(a) for a, _r in lst] or ["kde-screen-inhibit"]
+                names += [clean(a, 80) for a, _r in lst] \
+                    or ["kde-screen-inhibit"]
         except Exception:
             pass
         if self.sys is not None:
@@ -115,7 +158,7 @@ class Inhibitors:
                         dbus_interface="org.freedesktop.login1.Manager"):
                     if mode == "block" and "idle" in str(what).split(":") \
                             and int(uid) == os.getuid():
-                        names.append(str(who))
+                        names.append(clean(who, 80))
             except Exception:
                 pass
         return sorted(set(names))
@@ -163,37 +206,58 @@ def fullscreen_active():
 
 
 class WaylandIdle:
-    """Track compositor idle state from aquarium-wl-idle's stdout."""
+    """Track compositor idle state from aquarium-wl-idle's stdout.
+
+    Fail open toward the saver: until the helper is running AND has said
+    "ready", and again as soon as it exits, busy() is False. A missing or
+    crashing helper must never hold the saver (and the lock) off forever.
+    """
 
     def __init__(self, helper, timeout_ms):
-        self.active = True  # until the compositor says otherwise
+        self.active = False
         self.ok = False
+        self.rc = None
         try:
             self.proc = subprocess.Popen([helper, str(timeout_ms)],
-                                         stdout=subprocess.PIPE, text=True)
+                                         stdout=subprocess.PIPE,
+                                         stderr=subprocess.DEVNULL, text=True)
         except Exception as e:
-            log(f"wl-idle helper not started ({e}); Wayland inhibitors unseen")
+            log(f"wl-idle helper not started ({e}); using other signals only")
             self.proc = None
             return
-        threading.Thread(target=self._read, daemon=True).start()
+        self.reader = threading.Thread(target=self._read, daemon=True)
+        self.reader.start()
 
     def _read(self):
         for line in self.proc.stdout:
             line = line.strip()
             if line == "ready":
+                self.active = True   # notification starts in the active state
                 self.ok = True
             elif line == "idle":
                 self.active = False
             elif line == "active":
                 self.active = True
         self.ok = False
-        log(f"wl-idle helper exited rc={self.proc.wait()}")
+        self.active = False
+        self.proc.stdout.close()
+        self.rc = self.proc.wait()
+        log(f"wl-idle helper exited rc={self.rc}; using other signals only")
+
+    def alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def busy(self):
+        return self.ok and self.active and self.alive()
+
+    def stop(self):
+        if self.alive():
+            self.proc.terminate()
 
 
 def main():
-    lock_path = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"),
-                             "aquarium-idle-guard.lock")
-    lock = open(lock_path, "w")
+    lock_path = os.path.join(private_dir(), "aquarium-idle-guard.lock")
+    lock = os.fdopen(open_private(lock_path, os.O_WRONLY), "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -202,18 +266,23 @@ def main():
     log(f"start pid={os.getpid()} poll={POLL}s wl_timeout={WL_TIMEOUT_MS}ms")
     inh = Inhibitors()
     wl = WaylandIdle(WL_HELPER, WL_TIMEOUT_MS)
+    wl_started = time.monotonic()
     last = None
     while True:
-        if wl.proc is not None and wl.proc.poll() is not None:
-            time.sleep(POLL)
+        # Dead helper: retry at most every WL_RESPAWN s; exit 2 means the
+        # compositor lacks the protocol, so stop retrying.
+        if not wl.alive() and wl.rc != 2 \
+                and time.monotonic() - wl_started >= WL_RESPAWN:
             wl = WaylandIdle(WL_HELPER, WL_TIMEOUT_MS)
+            wl_started = time.monotonic()
+        wl_busy = wl.busy()
         blanked = xss_blanked()
         screen = inh.screen()
         audio = fs = False
-        if not blanked and not screen and not wl.active:
+        if not blanked and not screen and not wl_busy:
             audio = audio_playing()
             fs = audio and fullscreen_active()
-        action, reason = decide(blanked, screen, wl.active, audio, fs)
+        action, reason = decide(blanked, screen, wl_busy, audio, fs)
         state = (blanked, action, reason)
         if state != last:
             log(f"blanked={blanked} action={action} ({reason})")
