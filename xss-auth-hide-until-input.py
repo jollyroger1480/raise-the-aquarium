@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import os
 import re
+import select
+import struct
 import subprocess
 import sys
 import threading
@@ -58,6 +60,15 @@ if _env_allow:
     ALLOW_NAME_SUBSTR = tuple(s.strip().lower() for s in _env_allow.split(",") if s.strip())
 else:
     ALLOW_NAME_SUBSTR = _DEFAULT_ALLOW
+
+
+USER_BACK_FLAG = os.environ.get(
+    "DREAM_AQUARIUM_USER_BACK", "/tmp/dream-aquarium-user-back"
+)
+# linux/input.h input_event on 64-bit: timeval(16) + type u16 + code u16 + value s32
+_INPUT_EVENT = struct.Struct("llHHi")
+_EV_KEY = 0x01
+_EV_REL = 0x02
 
 
 def log(msg: str) -> None:
@@ -413,6 +424,100 @@ def aquarium_running() -> bool:
     return False
 
 
+def _seat_device_ok(name: str) -> bool:
+    low = name.lower()
+    if any(bad in low for bad in IGNORE_NAME_SUBSTR):
+        return False
+    if "hdmi" in low or "avrcp" in low or "video" in low:
+        return False
+    return any(ok in low for ok in ("mouse", "keyboard", "ares"))
+
+
+def _open_seat_devices() -> list[int]:
+    fds: list[int] = []
+    for node in os.listdir("/sys/class/input"):
+        if not node.startswith("event"):
+            continue
+        name_path = f"/sys/class/input/{node}/device/name"
+        dev = f"/dev/input/{node}"
+        try:
+            with open(name_path) as f:
+                name = f.read().strip()
+        except OSError:
+            continue
+        if not _seat_device_ok(name):
+            continue
+        try:
+            fds.append(os.open(dev, os.O_RDONLY | os.O_NONBLOCK))
+        except OSError as exc:
+            log(f"seat open {dev} ({name}) failed: {exc}")
+    return fds
+
+
+def watch_seat_input(stop: threading.Event, grace: float) -> None:
+    """Wayland apps never reach X, so xscreensaver stays blanked and Wine keeps
+    playing. A real key or mouse move on the seat means the user is back.
+    """
+    fds = _open_seat_devices()
+    if not fds:
+        log("seat watch: no keyboard/mouse devices")
+        return
+    log(f"seat watch: {len(fds)} devices, grace={grace:.0f}s")
+    t0 = time.time()
+    rel = 0
+    last_deactivate = 0.0
+    try:
+        while not stop.is_set():
+            ready, _, _ = select.select(fds, [], [], 0.4)
+            if stop.is_set():
+                break
+            hit = False
+            for fd in ready:
+                try:
+                    data = os.read(fd, 24 * 32)
+                except OSError:
+                    continue
+                for off in range(0, len(data) - 23, 24):
+                    _sec, _usec, evtype, _code, value = _INPUT_EVENT.unpack_from(data, off)
+                    if evtype == _EV_KEY and value == 1:
+                        hit = True
+                    elif evtype == _EV_REL:
+                        rel += abs(value)
+                        if rel >= 20:
+                            hit = True
+            if (time.time() - t0) < grace:
+                rel = 0
+                continue
+            if not hit:
+                continue
+            rel = 0
+            now = time.time()
+            if now - last_deactivate < 2.0:
+                continue
+            last_deactivate = now
+            try:
+                with open(USER_BACK_FLAG, "w") as f:
+                    f.write(str(now))
+            except OSError:
+                pass
+            log("seat input — ask xscreensaver to deactivate")
+            try:
+                subprocess.run(
+                    ["xscreensaver-command", "-deactivate"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=3,
+                )
+            except (subprocess.SubprocessError, OSError) as exc:
+                log(f"deactivate failed: {exc}")
+    finally:
+        for fd in fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 def saver_blanked() -> bool:
     """True while xscreensaver is actively blanked/locked."""
     try:
@@ -640,6 +745,10 @@ def main() -> int:
 
     park_thread = threading.Thread(target=parker, name="auth-parker", daemon=True)
     park_thread.start()
+    seat_thread = threading.Thread(
+        target=watch_seat_input, args=(stop, grace), name="seat-watch", daemon=True
+    )
+    seat_thread.start()
 
     def _safe_unpark(why: str) -> None:
         # Always attempt restore while blanked — even parks=0 (dialog under tank).
@@ -670,21 +779,34 @@ def main() -> int:
         # One-shot wait was the stuck-screensaver bug: helper exited, fish
         # covered the password box, no one left to raise it on keypress.
         reason = None
+        fast_fails = 0
         while not stop.is_set() and session_alive() and not revealed.is_set():
+            t_arm = time.time()
             reason = wait_real_login_input(grace, stop, names)
             if reason:
                 break
             if not session_alive() or stop.is_set():
                 break
-            log(
-                "input wait returned empty but session still alive — "
-                f"re-arm (parks={park_count['n']} aqua={aquarium_running()} "
-                f"blanked={saver_blanked()})"
-            )
-            # XWayland xinput test-xi2 often exits immediately during grab/reparent.
-            # Do not spin at 5 Hz (2026-09-14 log storm).
-            time.sleep(1.0)
-            # After first arm, grace already elapsed for the user
+            elapsed = time.time() - t_arm
+            # XWayland xinput test-xi2 exits immediately under the saver grab.
+            # Restarting it every second crashed the session. Back off hard.
+            if elapsed < 0.5:
+                fast_fails += 1
+                delay = min(15.0, 2.0 * fast_fails)
+                if fast_fails == 1 or fast_fails % 30 == 0:
+                    log(
+                        f"xinput died in {elapsed:.2f}s — backoff {delay:.0f}s "
+                        f"(fail {fast_fails})"
+                    )
+            else:
+                fast_fails = 0
+                delay = 1.0
+                log(
+                    "input wait returned empty but session still alive — "
+                    f"re-arm (parks={park_count['n']} aqua={aquarium_running()} "
+                    f"blanked={saver_blanked()})"
+                )
+            time.sleep(delay)
             grace = 0.0
 
         if reason:
